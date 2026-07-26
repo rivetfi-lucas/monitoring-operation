@@ -1,0 +1,92 @@
+# Reddit monitoring — scraper settings
+# Keywords live in keywords.yaml, sources live in sources.yaml (both separate
+# so you can send updated lists without touching this file).
+
+scraper:
+  # "Scrape last X days" — posts older than this are skipped. Applied
+  # client-side, since Chocodata's endpoints don't expose an arbitrary
+  # date-range filter (only Reddit's own hour/day/week/month/year "t" window).
+  # Used by full_scrape sources.
+  scrape_days: 7
+
+  # Same idea, but for keyword_search sources. Keyword searches turn up
+  # posts far less often than a subreddit's full feed, so it's often useful
+  # to look back further for them than for full_scrape sources. Falls back
+  # to scrape_days above if unset/null.
+  scrape_days_keyword_search: 30
+
+  # Skip posts with fewer than this many comments. 0 = no threshold (keep everything).
+  min_comments_threshold: 0
+
+  # Cap on posts pulled per source. 0 = unlimited (take everything available
+  # within scrape_days).
+  max_posts_per_source: 0
+
+  # Cap on comments pulled per post (after flattening the reply tree).
+  # 0 = unlimited (take everything Chocodata returns for that post).
+  max_comments_per_post: 0
+
+  # Page size requested per API call to Chocodata (subreddit/search endpoints).
+  # Chocodata's docs show `limit` examples around 25 — raise cautiously and
+  # confirm your plan/endpoint actually honors a higher value.
+  page_size: 25
+
+  # Seconds to wait between Chocodata requests. Also doubles as the base for
+  # exponential backoff on 429s.
+  request_delay_seconds: 1.0
+
+  # Sort order requested from Chocodata for full-feed sources. "new" keeps
+  # results chronological, which lets the scraper stop paginating early once
+  # it sees a post older than scrape_days, instead of always exhausting the
+  # full page budget.
+  full_scrape_sort: new
+
+  # Sort order requested for keyword-search sources. NOTE: Chocodata's
+  # /search doesn't do literal text filtering at all -- confirmed live,
+  # "new" sort returned posts barely related to the query (e.g. completely
+  # unrelated titles for a "plazo fijo" search), and even "relevance" sort
+  # still mixes in topically-related-but-non-matching posts (searching the
+  # distinctive word "tarjetear" returned 12 results, only 2 of which
+  # actually contained it). "relevance" at least surfaces true matches
+  # sooner than "new" does, but either way, the real exact-match filter now
+  # happens client-side in collect_keyword_search_candidates() -- see
+  # title_matches_keyword() in reddit_scraper_hybrid.py / reddit_scraper.py.
+  keyword_search_sort: relevance
+
+  # Chocodata's /post endpoint truncates comments per call (their own docs:
+  # typically ~13 of a post's num_comments, no pagination parameter exists).
+  # Their documented workaround is repeating the call with different comment
+  # `sort` values and merging by comment id, since each sort surfaces a
+  # different top-of-thread slice. This lists the sorts to try, in order;
+  # the scraper stops early once a pass isn't truncated or adds nothing new.
+  # NOTE: each extra pass is a full priced API call — set to just [top] to
+  # revert to one call per post (cheaper, but capped at ~13 comments).
+  comment_sort_passes: [top, new, controversial]
+
+  # Chocodata's own after_cursor field for /subreddit and /search comes back
+  # null (confirmed 41/41 in their own reddit-subreddit-scraper repo's
+  # README), so reddit_scraper.py now builds the `after` cursor itself from
+  # the last post's fullname (Reddit's own listing cursor scheme still works
+  # even though Chocodata never hands it back). This caps how many pages
+  # that manual pagination will walk per source/keyword before giving up —
+  # a safety valve against a cursor Reddit rejects silently re-serving page
+  # 1 forever. 0 = walk until a page yields zero new post ids.
+  max_pages_per_source: 20
+
+  # Optional Reddit time window ("all", "day", "week", "month", "year") to
+  # scope full_scrape_sort/keyword_search_sort when they're "top" or "best".
+  # Leave unset (or null) for "new"/"rising"/"hot" sorts, which ignore it.
+  timeframe: null
+
+# Used by reddit_scraper_hybrid.py only. Chocodata handles post discovery
+# (cheap); SocialFetch handles the full comment tree for every candidate
+# post (priced per page — see that script's docstring).
+hybrid:
+  # Cap on SocialFetch pages walked per post. 0 = unlimited (walk every
+  # branch of that post's tree to completion).
+  max_api_calls_per_post: 200
+
+  # Cap on total SocialFetch calls across the whole run, regardless of how
+  # many posts that spans — posts beyond this budget are skipped (logged,
+  # not silently dropped). null/0 = unlimited.
+  max_sf_calls_total_per_run: null
