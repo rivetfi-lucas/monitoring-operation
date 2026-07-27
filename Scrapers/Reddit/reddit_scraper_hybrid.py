@@ -1,7 +1,8 @@
 """
-Reddit monitor — Chocodata for post discovery, SocialFetch for full comment
-trees. Single self-contained script (no cross-imports of reddit_scraper.py /
-reddit_scraper_sf.py) combining the two things already established in this
+Reddit monitor — Chocodata for post discovery (and low-comment-count posts),
+SocialFetch for full comment trees on everything else. Single
+self-contained script (no cross-imports of reddit_scraper.py /
+reddit_scraper_sf.py) combining the things already established in this
 project:
 
   - Chocodata's /subreddit and /search listings paginate fine once you build
@@ -12,21 +13,29 @@ project:
     build_after_cursor(). Cheap, and good for discovering which posts exist.
   - Chocodata's /post endpoint has NO pagination mechanism for comments at
     all — confirmed live by passing after/comment_after/cursor/children/
-    offset params and getting byte-identical responses every time. So it's
-    not used here for comments at all.
+    offset params and getting byte-identical responses every time — and it
+    truncates to roughly the top ~13 comments per call regardless of sort
+    (see config.yaml's comment_sort_passes). That ceiling is a non-issue for
+    a post with fewer comments than the ceiling, though, so posts below
+    hybrid.chocodata_comment_threshold (default 10) are fetched via
+    Chocodata's /post instead of SocialFetch — one cheap call, no
+    SocialFetch credit spent. See fetch_chocodata_comments().
   - SocialFetch's /posts/comments genuinely paginates every level of a
     comment tree: its cursor is an opaque token that fully encodes which
     branch it continues (confirmed live by decoding one), so recursively
-    following every hasMore really does reach every comment. This is the
-    only backend used for comment extraction below (fetch_all_comments()).
+    following every hasMore really does reach every comment. Used for every
+    post at/above hybrid.chocodata_comment_threshold, where Chocodata's
+    truncation would otherwise silently miss comments. See
+    fetch_all_comments().
 
 Three input files drive this, same as the other scraper scripts:
     config.yaml   — scraper settings (days back, thresholds, caps)
     keywords.yaml — search terms for "keyword_search" type sources
     sources.yaml  — the list of subreddits to scrape, each with a type
 
-Cost model: Chocodata calls (discovery) are the cheap part. Every page of a
-post's comment tree via SocialFetch is a priced credit —
+Cost model: Chocodata calls (discovery, plus the full comment fetch for
+posts below hybrid.chocodata_comment_threshold) are the cheap part. Every
+page of a post's comment tree via SocialFetch is a priced credit —
 hybrid.max_api_calls_per_post (default 20) caps how many pages one post's
 tree walk can spend, and hybrid.max_sf_calls_total_per_run (or
 --max-sf-calls-total) additionally caps total SocialFetch spend across the
@@ -99,10 +108,19 @@ COMMENT_AUTHOR_PATHS = ["author.username", "author"]
 COMMENT_SCORE_PATHS = ["score", "upvotes"]
 COMMENT_BODY_PATHS = ["text", "body"]
 COMMENT_PERMALINK_PATHS = ["url", "permalink"]
-COMMENT_CREATED_PATHS = ["createdUtc", "createdAt"]
-COMMENT_PARENT_ID_PATHS = ["parentId"]
+COMMENT_CREATED_PATHS = ["createdUtc", "createdAt", "created_utc", "created_at", "created"]
+COMMENT_PARENT_ID_PATHS = ["parentId", "parent_id"]
 COMMENT_REPLIES_ITEMS_PATHS = ["replies.items"]
 COMMENT_REPLIES_PAGE_PATHS = ["replies.page"]
+
+# Chocodata's /post response, unlike SocialFetch's, isn't paginated at all —
+# it's a nested comment tree returned in a single shot (just truncated, see
+# fetch_chocodata_comments()). Unconfirmed against a live response since
+# this path wasn't exercised before; check these against a real payload the
+# first time chocodata_comment_threshold routes a post through it, same as
+# the PATHS constants above.
+CHOCODATA_COMMENTS_LIST_PATHS = ["comments"]
+CHOCODATA_REPLIES_LIST_PATHS = ["replies"]
 
 
 def dig(obj, dotted_path):
@@ -305,6 +323,18 @@ class ChocodataClient:
             params["after"] = after
         return self._get("search", params)
 
+    def post(self, post_url, sort="top"):
+        """/post endpoint: no pagination (confirmed — see module
+        docstring), truncates to roughly the top ~13 comments per call
+        regardless of `sort`. Only called for posts under
+        hybrid.chocodata_comment_threshold, where that ceiling isn't
+        actually a limitation. Needs a full post URL — confirmed live
+        that post_id alone 404s with "A subreddit is required for this
+        request. Pass a full post URL, or add subreddit alongside
+        post_id" — so this takes the same full permalink SocialFetch's
+        post_comments() uses, not a bare id."""
+        return self._get("post", {"url": post_url, "sort": sort})
+
 
 # ---------- SocialFetch client (comment trees only) ----------
 
@@ -418,6 +448,63 @@ def fetch_all_comments(client, post_url, max_comments=None, max_api_calls=None):
     if max_comments:
         collected = collected[:max_comments]
     return collected, post_detail, calls_made, truncated_by_cap
+
+
+def _flatten_chocodata_comments(items, depth, seen_ids, collected):
+    for item in items or []:
+        cid = first_match(item, COMMENT_ID_PATHS)
+        if cid and cid not in seen_ids:
+            seen_ids.add(cid)
+            collected.append({"comment": item, "depth": depth})
+        replies = first_match(item, CHOCODATA_REPLIES_LIST_PATHS)
+        if replies:
+            _flatten_chocodata_comments(replies, depth + 1, seen_ids, collected)
+
+
+def fetch_chocodata_comments(client, post_url, sort_passes, max_comments=None, expected_total=None):
+    """Cheap path for low-comment posts (below hybrid.chocodata_comment_
+    threshold): Chocodata's /post has no real client-facing pagination,
+    but its ~13-comment truncation (see config.yaml's comment_sort_passes)
+    isn't a real limitation there, so one call is normally enough. Still
+    walks comment_sort_passes and merges by id as a safety net for posts
+    that turn out to run a little over — stops as soon as a pass reports
+    _meta.truncated: false (confirmed live — that field is authoritative,
+    more so than comparing against the post's own num_comments, which can
+    be stale), adds nothing new, or expected_total is reached. Returns
+    (flat_list, calls_made, truncated_below_expected)."""
+    collected = []
+    seen_ids = set()
+    calls_made = 0
+    meta_truncated = None
+
+    for sort in sort_passes or ["top"]:
+        data = client.post(post_url, sort=sort)
+        calls_made += 1
+        if not data:
+            continue
+
+        before = len(collected)
+        comments = first_match(data, CHOCODATA_COMMENTS_LIST_PATHS, warn_label="chocodata comments list") or []
+        _flatten_chocodata_comments(comments, 0, seen_ids, collected)
+        added = len(collected) - before
+        meta_truncated = dig(data, "_meta.truncated")
+
+        if max_comments and len(collected) >= max_comments:
+            break
+        if meta_truncated is False:
+            break
+        if expected_total and len(collected) >= expected_total:
+            break
+        if added == 0 and calls_made > 1:
+            break
+
+    if meta_truncated is False:
+        truncated = False
+    else:
+        truncated = bool(expected_total and len(collected) < expected_total)
+    if max_comments:
+        collected = collected[:max_comments]
+    return collected, calls_made, truncated
 
 
 # ---------- row builder ----------
@@ -788,6 +875,8 @@ def run(config_path="config.yaml", keywords_path="keywords.yaml", sources_path="
         "max_pages_per_source": settings.get("max_pages_per_source", 20),
         "max_api_calls_per_post": max_api_calls_override if max_api_calls_override is not None else hybrid_settings.get("max_api_calls_per_post", 20),
         "max_sf_calls_total_per_run": max_sf_calls_total_override if max_sf_calls_total_override is not None else hybrid_settings.get("max_sf_calls_total_per_run"),
+        "chocodata_comment_threshold": hybrid_settings.get("chocodata_comment_threshold", 10),
+        "comment_sort_passes": settings.get("comment_sort_passes") or ["top"],
     }
 
     all_keywords = []
@@ -821,6 +910,8 @@ def run(config_path="config.yaml", keywords_path="keywords.yaml", sources_path="
     all_new_rows = []
     new_ids_this_run = set()
     posts_skipped_budget = 0
+    total_posts_via_chocodata = 0
+    total_posts_via_socialfetch = 0
 
     for source in sources_data:
         name = source["name"]
@@ -847,9 +938,12 @@ def run(config_path="config.yaml", keywords_path="keywords.yaml", sources_path="
             print(f"  {before} candidates -> {len(candidates)} with >= {threshold} comments")
 
         sub_new_count = 0
+        posts_via_chocodata = 0
+        posts_via_socialfetch = 0
         for post_id, (post, matched_keyword) in candidates.items():
             title = first_match(post, POST_TITLE_PATHS) or ""
             permalink = to_full_reddit_url(first_match(post, POST_PERMALINK_PATHS))
+            num_comments = first_match(post, POST_NUM_COMMENTS_PATHS)
             print(f"  fetching comments for {post_id} ({title[:60]!r})")
             if dry_run:
                 continue
@@ -857,24 +951,43 @@ def run(config_path="config.yaml", keywords_path="keywords.yaml", sources_path="
                 print("    [warn] no permalink found for this post, skipping comments")
                 continue
 
-            budget_total = cfg["max_sf_calls_total_per_run"]
-            per_post_cap = cfg["max_api_calls_per_post"]
-            if budget_total:
-                remaining = budget_total - sf_client.total_requests
-                if remaining <= 0:
-                    print(f"    [budget] SocialFetch run budget ({budget_total}) exhausted — skipping")
-                    posts_skipped_budget += 1
-                    continue
-                effective_cap = remaining if not per_post_cap else min(per_post_cap, remaining)
-            else:
-                effective_cap = per_post_cap
+            threshold = cfg["chocodata_comment_threshold"]
+            use_chocodata = bool(threshold) and num_comments is not None and num_comments < threshold
 
-            flat, _detail, calls_made, truncated_by_cap = fetch_all_comments(
-                sf_client, permalink,
-                max_comments=cfg["max_comments_per_post"], max_api_calls=effective_cap,
-            )
-            cap_note = " [capped — more comments/replies remained]" if truncated_by_cap else ""
-            print(f"    {len(flat)} comment(s) via {calls_made} call(s){cap_note}")
+            flat = None
+            if use_chocodata:
+                flat, calls_made, truncated_by_cap = fetch_chocodata_comments(
+                    choco_client, permalink, cfg["comment_sort_passes"],
+                    max_comments=cfg["max_comments_per_post"], expected_total=num_comments,
+                )
+                if not flat and num_comments:
+                    print(f"    [warn] Chocodata returned 0 comments for a post reporting {num_comments} — falling back to SocialFetch")
+                    flat = None
+                else:
+                    posts_via_chocodata += 1
+                    cap_note = " [fewer than expected — Chocodata truncation likely]" if truncated_by_cap else ""
+                    print(f"    {len(flat)} comment(s) via Chocodata, {calls_made} call(s){cap_note}")
+
+            if flat is None:
+                budget_total = cfg["max_sf_calls_total_per_run"]
+                per_post_cap = cfg["max_api_calls_per_post"]
+                if budget_total:
+                    remaining = budget_total - sf_client.total_requests
+                    if remaining <= 0:
+                        print(f"    [budget] SocialFetch run budget ({budget_total}) exhausted — skipping")
+                        posts_skipped_budget += 1
+                        continue
+                    effective_cap = remaining if not per_post_cap else min(per_post_cap, remaining)
+                else:
+                    effective_cap = per_post_cap
+
+                flat, _detail, calls_made, truncated_by_cap = fetch_all_comments(
+                    sf_client, permalink,
+                    max_comments=cfg["max_comments_per_post"], max_api_calls=effective_cap,
+                )
+                posts_via_socialfetch += 1
+                cap_note = " [capped — more comments/replies remained]" if truncated_by_cap else ""
+                print(f"    {len(flat)} comment(s) via SocialFetch, {calls_made} call(s){cap_note}")
 
             for item in flat:
                 cid = first_match(item["comment"], COMMENT_ID_PATHS)
@@ -885,11 +998,16 @@ def run(config_path="config.yaml", keywords_path="keywords.yaml", sources_path="
                     new_ids_this_run.add(cid)
                     sub_new_count += 1
 
-        print(f"  -> {len(candidates)} candidate posts, {sub_new_count} new comments found")
+        print(f"  -> {len(candidates)} candidate posts, {sub_new_count} new comments found"
+              f" ({posts_via_chocodata} via Chocodata, {posts_via_socialfetch} via SocialFetch)")
+        total_posts_via_chocodata += posts_via_chocodata
+        total_posts_via_socialfetch += posts_via_socialfetch
 
-    print(f"\nChocodata: {choco_client.total_requests} request(s) (discovery).")
+    print(f"\nChocodata: {choco_client.total_requests} request(s) (discovery + comments).")
     print(f"SocialFetch: {sf_client.total_requests} request(s), {sf_client.total_credits_charged} credit(s) charged."
           + (f" {posts_skipped_budget} post(s) skipped (run budget exhausted)." if posts_skipped_budget else ""))
+    print(f"Cost split: {total_posts_via_chocodata} post(s) via Chocodata (<{cfg['chocodata_comment_threshold']} comments), "
+          f"{total_posts_via_socialfetch} post(s) via SocialFetch (>={cfg['chocodata_comment_threshold']} comments, or count unknown).")
 
     if dry_run:
         print("\n[--dry-run] Stopped before fetching comments — no CSV written, no state updated.")

@@ -61,6 +61,9 @@ scraper:
   # the scraper stops early once a pass isn't truncated or adds nothing new.
   # NOTE: each extra pass is a full priced API call — set to just [top] to
   # revert to one call per post (cheaper, but capped at ~13 comments).
+  # Used by reddit_scraper_hybrid.py's Chocodata comment path (see
+  # hybrid.chocodata_comment_threshold below) — the ~13 ceiling almost never
+  # matters there since that path only ever handles low-comment posts.
   comment_sort_passes: [top, new, controversial]
 
   # Chocodata's own after_cursor field for /subreddit and /search comes back
@@ -79,9 +82,18 @@ scraper:
   timeframe: null
 
 # Used by reddit_scraper_hybrid.py only. Chocodata handles post discovery
-# (cheap); SocialFetch handles the full comment tree for every candidate
-# post (priced per page — see that script's docstring).
+# (cheap) plus the comment fetch itself for low-comment posts; SocialFetch
+# handles the full comment tree for everything else (priced per page — see
+# that script's docstring).
 hybrid:
+  # Posts with fewer comments than this are fetched via Chocodata's /post
+  # instead of SocialFetch — Chocodata's ~13-comment-per-call truncation
+  # (see comment_sort_passes above) isn't a real limitation below this
+  # threshold, so it's a free win: one cheap Chocodata call instead of a
+  # priced SocialFetch page walk. Posts at/above this threshold still go to
+  # SocialFetch, since only it can genuinely paginate a full tree.
+  chocodata_comment_threshold: 10
+
   # Cap on SocialFetch pages walked per post. 0 = unlimited (walk every
   # branch of that post's tree to completion).
   max_api_calls_per_post: 200
