@@ -1,0 +1,6 @@
+# Add one Reddit post ID or full URL per line.
+# Blank lines and lines beginning with # are ignored.
+
+1vb991e
+# t3_abc123
+# https://www.reddit.com/r/OffGrid/comments/1vb991e/be_realstic_no_hate/

@@ -1,0 +1,99 @@
+paths:
+  # All generated files stay inside this local folder.
+  data_dir: data
+  comments_csv: data/exports/reddit_comments.csv
+  posts_csv: data/exports/reddit_posts.csv
+  state_db: data/state/scraper.sqlite3
+  profile_dir: data/browser_profile
+  snapshots_dir: data/runs
+
+scraper:
+  # Lookback windows for the two source modes.
+  scrape_days: 30
+  scrape_days_keyword_search: 30
+
+  # Skip threads with fewer displayed comments. Set to 0 to keep all.
+  min_comments_threshold: 0
+
+  # 0 means unlimited.
+  max_posts_per_source: 0
+  max_comments_per_post: 0
+  max_pages_per_source: 10
+
+  full_scrape_sort: new
+  keyword_search_sort: new
+  timeframe: all
+  comment_sort: old
+
+  skip_stickied: true
+  include_deleted_comments: false
+
+  # Number of ancestor comments copied into context_text for Claude.
+  context_ancestor_limit: 8
+
+  # A single problematic thread cannot block the entire weekly run forever.
+  # 0 disables the timeout. 900 seconds = 15 minutes per post.
+  post_timeout_seconds: 100
+
+  # Restart Firefox and retry a failed/timed-out post this many times.
+  post_retries: 1
+
+browser:
+  # Firefox headless is the tested/default mode. Set false while debugging.
+  headless: true
+
+  # Uses an isolated Firefox profile under data/browser_profile/firefox.
+  # It preserves browser state between runs and is not a personal profile.
+  persistent_profile: true
+
+  timeout_seconds: 45
+  navigation_retries: 3
+
+  # Try old Reddit's simpler markup first. If it rejects a page, retry the
+  # equivalent modern www.reddit.com URL automatically.
+  prefer_old_reddit: true
+  fallback_to_modern_reddit: true
+
+  # Randomized pacing. Each action chooses a delay within its range.
+  request_delay_min_seconds: 2.0
+  request_delay_max_seconds: 4.5
+  expansion_delay_min_seconds: 0.9
+  expansion_delay_max_seconds: 2.0
+  scroll_delay_min_seconds: 0.8
+  scroll_delay_max_seconds: 1.7
+
+  # Modern Reddit lazy-loads listings/comments while scrolling.
+  max_listing_scrolls: 20
+  max_comment_scrolls: 30
+  scroll_step_pixels: 850
+  scroll_stable_rounds: 3
+
+  # Safety caps for very large threads. 0 means unlimited.
+  max_more_clicks_per_post: 750
+  max_continue_pages_per_post: 150
+
+  # Stop clicking a stuck loader after this many clicks make no DOM progress.
+  max_no_progress_rounds: 5
+
+  # Print a heartbeat during large comment expansions.
+  progress_log_every_clicks: 10
+
+  # Recycle Firefox periodically to release browser memory on multi-thousand
+  # post runs. Set 0 to keep one browser session for the entire run.
+  restart_every_posts: 50
+
+  slow_mo_ms: 0
+  block_images: true
+
+  # Leave blank to use Playwright Firefox's native user agent. If set, use a
+  # real Firefox user-agent string rather than a Chrome user agent.
+  user_agent:
+
+output:
+  # Maintains stable deduplicated master CSVs. Existing IDs are refreshed when
+  # parent/context metadata improves; new IDs are added without duplicates.
+  append_master_csv: true
+
+  # Writes one run folder incrementally. Each completed post is appended
+  # immediately, and failed_posts.txt can be used with --repair-posts.
+  create_run_snapshots: true

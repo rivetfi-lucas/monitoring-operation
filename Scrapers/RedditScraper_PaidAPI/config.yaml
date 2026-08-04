@@ -18,8 +18,9 @@ scraper:
   # Skip posts with fewer than this many comments. 0 = no threshold (keep everything).
   min_comments_threshold: 0
 
-  # Cap on posts pulled per source. 0 = unlimited (take everything available
-  # within scrape_days).
+  # Cap on NEW posts pulled per source after IDs already present in SQLite
+  # are removed. 0 = unlimited (take every new post available within the
+  # configured lookback window).
   max_posts_per_source: 0
 
   # Cap on comments pulled per post (after flattening the reply tree).

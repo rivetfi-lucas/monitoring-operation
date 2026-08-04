@@ -1,0 +1,68 @@
+# Keyword vocabulary used as search terms for "keyword_search" type sources
+# (see sources.yaml). Three categories, matching the Question Architecture's
+# Section 5 vocabulary. The scraper just flattens all three lists into one
+# combined set of search terms — the category split here is for
+# readability/maintenance, not different scraper behavior per category.
+
+crypto_wallets_exchanges:
+  - Lemon
+  - Lemon Cash
+  - Tarjeta Lemon
+  - Belo
+  - Binance
+  - Bitget
+  - Bitso
+  - Buenbit
+  - Fiwind
+  - Let'sBit
+  - Littio
+  - Ripio
+  - Satoshi Tango
+  - SatoshiTango
+  - Ugly Cash
+  - DolarApp
+  - TiendaCrypto
+  - USDT
+  - USDC
+  - Dólar cripto
+  - Cripto dólar
+
+peso_apps_rate_tools:
+  - Rendimientos Mercado Pago
+  - Cuenta DNI
+  - Promo MODO
+  - Descuento MODO
+  - Ualá
+  - Naranja X
+  - Brubank
+  - Personal Pay
+  - Prex
+  - DolarHoy
+  - Dolarito
+  - Dolar Ambito
+  - Balanz
+  - Bull Market
+  - Cocos
+  - IOL / InvertirOnline
+  - CriptoYa
+  - Ratoneando
+
+behavior_phrases:
+  - rulo
+  - hacer rulo
+  - rulear
+  - stockear
+  - stockearse
+  - patear compra
+  - tarjetear
+  - financiar
+  - sacar en cuotas
+  - plazo fijo
+  - credito UVA
+  - FCI
+  - Planilla de gastos
+  - Excel de gastos
+  - Dolarizar
+  - Dolarizarse
+  - cuotas sin interés
+  - promos bancarias

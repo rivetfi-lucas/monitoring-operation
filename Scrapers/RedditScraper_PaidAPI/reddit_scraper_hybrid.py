@@ -44,19 +44,28 @@ not silently truncated.
 
 Usage:
     python reddit_scraper_hybrid.py                          # interactive menu
-    python reddit_scraper_hybrid.py --all
-    python reddit_scraper_hybrid.py --source merval --days 1 --max-posts 2 --max-sf-calls-total 30
+    python reddit_scraper_hybrid.py --all                    # incremental: new posts only
+    python reddit_scraper_hybrid.py --source merval --days 1 --max-posts 2
+    python reddit_scraper_hybrid.py --repair-posts repair_posts.txt
+
+Incremental behavior:
+    Normal source runs skip post IDs already present in SQLite before any
+    comment fetch. The post cap is applied after that filtering. Repair mode
+    is explicit and re-fetches only the IDs/URLs listed in the input file.
 
 Output:
-    output/reddit_comments_<UTC timestamp>.csv   (only created if there's new data)
-    state/seen_comment_ids.txt                    (updated after every run)
+    output/reddit_comments_<UTC timestamp>.csv          (new comments only)
+    output/reddit_comments_repair_<UTC timestamp>.csv   (targeted repair rows)
+    state/scraper_state.db                               (dedup + post history)
 
-Requires both CHOCODATA_API_KEY and SOCIALFETCH_API_KEY (env vars or .env).
+Normal source runs require both API keys. Targeted repair requires SocialFetch only.
 """
 import argparse
 import base64
 import csv
 import os
+import re
+import sqlite3
 import time
 import unicodedata
 from collections import deque
@@ -78,7 +87,9 @@ REDDIT_BASE = "https://www.reddit.com"
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 STATE_DIR = os.path.join(os.path.dirname(__file__), "state")
-SEEN_IDS_PATH = os.path.join(STATE_DIR, "seen_comment_ids.txt")
+STATE_DB_PATH = os.path.join(STATE_DIR, "scraper_state.db")
+LEGACY_SEEN_IDS_PATH = os.path.join(STATE_DIR, "seen_comment_ids.txt")
+POST_ID_RE = re.compile(r"^[a-z0-9]+$", re.I)
 
 COMMENT_FIELDS = [
     "comment_id", "thread_id", "thread_title", "subreddit", "intake_mode",
@@ -150,31 +161,193 @@ def load_yaml(path):
         return yaml.safe_load(f)
 
 
-def load_seen_ids(path=SEEN_IDS_PATH):
-    if not os.path.exists(path):
-        return set()
-    with open(path, "r", encoding="utf-8") as f:
-        return {line.strip() for line in f if line.strip()}
+def open_state_db(path=STATE_DB_PATH):
+    """Open/create the SQLite state database and migrate the old text ledger.
 
-
-def append_seen_ids(new_ids, path=SEEN_IDS_PATH):
-    if not new_ids:
-        return
+    SQLite keeps deduplication reliable as the dataset grows and also records
+    post-level scrape history. The legacy seen_comment_ids.txt file is imported
+    automatically once, so upgrading does not cause old comments to be exported
+    again.
+    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        for cid in new_ids:
-            f.write(cid + "\n")
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scraped_comments (
+            comment_id TEXT PRIMARY KEY,
+            thread_id TEXT,
+            subreddit TEXT,
+            parent_id TEXT,
+            depth INTEGER,
+            first_seen_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scraped_posts (
+            post_id TEXT PRIMARY KEY,
+            subreddit TEXT,
+            source_type TEXT,
+            matched_keyword TEXT,
+            title TEXT,
+            permalink TEXT,
+            reported_comment_count INTEGER,
+            fetched_comment_count INTEGER NOT NULL DEFAULT 0,
+            was_truncated INTEGER NOT NULL DEFAULT 0,
+            first_seen_at TEXT NOT NULL,
+            last_scraped_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_scraped_comments_thread_id "
+        "ON scraped_comments(thread_id)"
+    )
+
+    migrated = conn.execute(
+        "SELECT value FROM scraper_meta WHERE key = 'legacy_txt_migrated'"
+    ).fetchone() if _table_exists(conn, "scraper_meta") else None
+    if not _table_exists(conn, "scraper_meta"):
+        conn.execute(
+            "CREATE TABLE scraper_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+
+    if not migrated and os.path.exists(LEGACY_SEEN_IDS_PATH):
+        now = datetime.now(timezone.utc).isoformat()
+        with open(LEGACY_SEEN_IDS_PATH, "r", encoding="utf-8") as f:
+            ids = [(line.strip(), now) for line in f if line.strip()]
+        if ids:
+            conn.executemany(
+                "INSERT OR IGNORE INTO scraped_comments(comment_id, first_seen_at) VALUES (?, ?)",
+                ids,
+            )
+        conn.execute(
+            "INSERT OR REPLACE INTO scraper_meta(key, value) VALUES ('legacy_txt_migrated', ?)",
+            (now,),
+        )
+        print(f"Migrated {len(ids)} legacy comment ID(s) into SQLite state.")
+
+    conn.commit()
+    return conn
 
 
-def write_csv(rows, fieldnames):
+def _table_exists(conn, name):
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone()
+    return row is not None
+
+
+def load_seen_ids(conn):
+    return {row[0] for row in conn.execute("SELECT comment_id FROM scraped_comments")}
+
+
+def load_known_post_ids(conn):
+    """Return post IDs that have already completed a scrape.
+
+    Normal source runs use this before any comment API call, so weekly runs
+    spend credits only on posts that are not yet present in SQLite.
+    """
+    return {normalize_post_id(row[0]) for row in conn.execute("SELECT post_id FROM scraped_posts")}
+
+
+def get_scraped_post(conn, post_id):
+    """Return stored metadata for a post, or ``None`` when it is unknown."""
+    row = conn.execute(
+        """
+        SELECT post_id, subreddit, source_type, matched_keyword, title, permalink,
+               reported_comment_count, fetched_comment_count, was_truncated,
+               first_seen_at, last_scraped_at
+        FROM scraped_posts
+        WHERE post_id IN (?, ?)
+        ORDER BY CASE WHEN post_id = ? THEN 0 ELSE 1 END
+        LIMIT 1
+        """,
+        (str(post_id), to_fullname(post_id), str(post_id)),
+    ).fetchone()
+    if not row:
+        return None
+    keys = (
+        "post_id", "subreddit", "source_type", "matched_keyword", "title",
+        "permalink", "reported_comment_count", "fetched_comment_count",
+        "was_truncated", "first_seen_at", "last_scraped_at",
+    )
+    return dict(zip(keys, row))
+
+
+def save_scrape_state(conn, comment_rows, post_rows):
+    """Upsert comment metadata and post scrape history in one transaction.
+
+    The comment upsert is important for targeted repair mode: existing IDs keep
+    their original ``first_seen_at`` value while parent/depth/thread metadata is
+    refreshed from the newly fetched tree.
+    """
+    with conn:
+        conn.executemany(
+            """
+            INSERT INTO scraped_comments(
+                comment_id, thread_id, subreddit, parent_id, depth, first_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(comment_id) DO UPDATE SET
+                thread_id=excluded.thread_id,
+                subreddit=excluded.subreddit,
+                parent_id=excluded.parent_id,
+                depth=excluded.depth
+            """,
+            [
+                (
+                    row["comment_id"], row.get("thread_id", ""), row.get("subreddit", ""),
+                    row.get("parent_id", ""), int(row.get("depth") or 0),
+                    row.get("fetched_at") or datetime.now(timezone.utc).isoformat(),
+                )
+                for row in comment_rows if row.get("comment_id")
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO scraped_posts(
+                post_id, subreddit, source_type, matched_keyword, title, permalink,
+                reported_comment_count, fetched_comment_count, was_truncated,
+                first_seen_at, last_scraped_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(post_id) DO UPDATE SET
+                subreddit=excluded.subreddit,
+                source_type=excluded.source_type,
+                matched_keyword=excluded.matched_keyword,
+                title=excluded.title,
+                permalink=excluded.permalink,
+                reported_comment_count=excluded.reported_comment_count,
+                fetched_comment_count=excluded.fetched_comment_count,
+                was_truncated=excluded.was_truncated,
+                last_scraped_at=excluded.last_scraped_at
+            """,
+            [
+                (
+                    row["post_id"], row.get("subreddit", ""), row.get("source_type", ""),
+                    row.get("matched_keyword", ""), row.get("title", ""),
+                    row.get("permalink", ""), row.get("reported_comment_count"),
+                    int(row.get("fetched_comment_count") or 0),
+                    1 if row.get("was_truncated") else 0,
+                    row.get("first_seen_at") or row["last_scraped_at"],
+                    row["last_scraped_at"],
+                )
+                for row in post_rows if row.get("post_id")
+            ],
+        )
+
+
+def write_csv(rows, fieldnames, filename_prefix="reddit_comments"):
     if not rows:
         return None
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(OUTPUT_DIR, f"reddit_comments_{timestamp}.csv")
+    path = os.path.join(OUTPUT_DIR, f"{filename_prefix}_{timestamp}.csv")
     suffix = 2
     while os.path.exists(path):
-        path = os.path.join(OUTPUT_DIR, f"reddit_comments_{timestamp}_{suffix}.csv")
+        path = os.path.join(OUTPUT_DIR, f"{filename_prefix}_{timestamp}_{suffix}.csv")
         suffix += 1
     with open(path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -267,6 +440,109 @@ def strip_fullname_prefix(reddit_id):
     if reddit_id and str(reddit_id)[:3] in ("t1_", "t3_"):
         return reddit_id[3:]
     return reddit_id
+
+
+def normalize_post_id(value):
+    """Normalize a Reddit post fullname or bare ID to the bare ID."""
+    if value is None:
+        return ""
+    return str(strip_fullname_prefix(str(value).strip())).casefold()
+
+
+def post_id_from_url(url):
+    """Extract a post ID from a Reddit comments URL."""
+    if not url:
+        return ""
+    parts = [part for part in urlparse(str(url)).path.split("/") if part]
+    for index, part in enumerate(parts):
+        if part.casefold() == "comments" and index + 1 < len(parts):
+            return normalize_post_id(parts[index + 1])
+    return ""
+
+
+def filter_new_candidates(candidates, known_post_ids, max_posts=0):
+    """Remove all known posts first, then apply the requested new-post cap."""
+    selected = {
+        post_id: payload
+        for post_id, payload in candidates.items()
+        if normalize_post_id(post_id) not in known_post_ids
+    }
+    skipped = len(candidates) - len(selected)
+    if max_posts:
+        selected = dict(list(selected.items())[:max_posts])
+    return selected, skipped
+
+
+def _repair_target_to_candidate(raw, conn):
+    """Convert one repair-file ID/URL into the normal candidate shape."""
+    target = str(raw).strip()
+    if not target:
+        raise ValueError("repair target cannot be empty")
+
+    if target.startswith(("http://", "https://")):
+        permalink = to_full_reddit_url(target)
+        bare_id = post_id_from_url(permalink)
+        if not bare_id:
+            raise ValueError(f"invalid Reddit post URL: {raw!r}")
+    else:
+        bare_id = normalize_post_id(target)
+        if not POST_ID_RE.fullmatch(bare_id):
+            raise ValueError(
+                f"invalid repair target {raw!r}; expected a Reddit post ID or URL"
+            )
+        stored = get_scraped_post(conn, bare_id)
+        permalink = (stored or {}).get("permalink") or f"{REDDIT_BASE}/comments/{bare_id}/"
+
+    stored = get_scraped_post(conn, bare_id)
+    parsed = urlparse(permalink)
+    path_parts = [part for part in parsed.path.split("/") if part]
+    subreddit = (stored or {}).get("subreddit") or ""
+    if not subreddit and len(path_parts) >= 2 and path_parts[0].casefold() == "r":
+        subreddit = path_parts[1]
+
+    title = (stored or {}).get("title") or ""
+    reported_count = (stored or {}).get("reported_comment_count")
+    post = {
+        "id": (stored or {}).get("post_id") or bare_id,
+        "title": title,
+        "permalink": permalink,
+        "num_comments": reported_count,
+    }
+    return {
+        "post_id": (stored or {}).get("post_id") or bare_id,
+        "normalized_post_id": bare_id,
+        "post": post,
+        "subreddit": subreddit,
+        "source_type": (stored or {}).get("source_type") or "repair",
+        "intake_mode": "repair",
+        "matched_keyword": (stored or {}).get("matched_keyword") or "",
+    }
+
+
+def load_repair_candidates(path, conn):
+    """Load unique post IDs/URLs from a text file for targeted repair."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"repair input file not found: {path}")
+
+    candidates = {}
+    errors = []
+    with open(path, "r", encoding="utf-8-sig") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            target = line.strip()
+            if not target or target.startswith("#"):
+                continue
+            try:
+                candidate = _repair_target_to_candidate(target, conn)
+            except ValueError as error:
+                errors.append(f"line {line_number}: {error}")
+                continue
+            candidates[candidate["normalized_post_id"]] = candidate
+
+    if errors:
+        raise ValueError("Invalid repair input:\n  - " + "\n  - ".join(errors))
+    if not candidates:
+        raise ValueError(f"no post IDs or URLs were found in {path}")
+    return list(candidates.values())
 
 
 # ---------- Chocodata client (post discovery only) ----------
@@ -393,19 +669,58 @@ class SocialFetchClient:
 # ---------- full comment-tree extraction (recursive cursor pagination) ----------
 
 def fetch_all_comments(client, post_url, max_comments=None, max_api_calls=None):
-    """Walks SocialFetch's comment pagination to depth-and-breadth-complete
-    coverage. depth is tracked locally (not trusted from the API's own
-    `depth` field, which was observed resetting to 0 on reply-branch pages).
-    Stops once max_comments or max_api_calls is hit — pass 0/None for
-    unbounded extraction. Returns (flat_list, post_detail, calls_made,
-    truncated_by_cap)."""
+    """Fetch a depth-complete SocialFetch comment tree.
+
+    SocialFetch can return replies inline at any nesting level, while every
+    replies object can also expose its own pagination cursor. The previous
+    implementation only flattened the first inline reply level, which silently
+    dropped grandchildren and deeper branches. This walker recursively visits
+    every inline reply and queues every nested cursor, while preserving the
+    locally known depth for branch continuation pages.
+
+    Returns (flat_list, post_detail, calls_made, truncated_by_cap).
+    """
     collected = []
     seen_ids = set()
+    seen_cursors = set()
     calls_made = 0
     truncated_by_cap = False
     post_detail = None
 
-    queue = deque([(None, 0)])  # (cursor_or_None, depth)
+    # Each queue item stores the cursor and the depth of comments returned by
+    # that cursor. The root request returns depth-0 comments.
+    queue = deque([(None, 0)])
+
+    def enqueue_cursor(cursor, depth):
+        if not cursor:
+            return
+        key = (cursor, depth)
+        if key not in seen_cursors:
+            seen_cursors.add(key)
+            queue.append((cursor, depth))
+
+    def walk_comment(item, depth):
+        nonlocal truncated_by_cap
+        if max_comments and len(collected) >= max_comments:
+            truncated_by_cap = True
+            return False
+
+        cid = first_match(item, COMMENT_ID_PATHS)
+        if cid and cid not in seen_ids:
+            seen_ids.add(cid)
+            collected.append({"comment": item, "depth": depth})
+
+        replies = first_match(item, COMMENT_REPLIES_ITEMS_PATHS) or []
+        for reply in replies:
+            if not walk_comment(reply, depth + 1):
+                return False
+
+        replies_page = first_match(item, COMMENT_REPLIES_PAGE_PATHS) or {}
+        if replies_page.get("hasMore") and replies_page.get("nextCursor"):
+            # The cursor continues the direct children of this comment.
+            enqueue_cursor(replies_page["nextCursor"], depth + 1)
+
+        return True
 
     while queue:
         if max_comments and len(collected) >= max_comments:
@@ -415,38 +730,26 @@ def fetch_all_comments(client, post_url, max_comments=None, max_api_calls=None):
             truncated_by_cap = True
             break
 
-        cursor, depth = queue.popleft()
+        cursor, base_depth = queue.popleft()
         data = client.post_comments(post_url, cursor=cursor)
         calls_made += 1
         if not data:
             continue
-        if post_detail is None:
+        if post_detail is None and data.get("post"):
             post_detail = data.get("post")
 
         for item in data.get("comments", []) or []:
-            cid = first_match(item, COMMENT_ID_PATHS)
-            if cid and cid not in seen_ids:
-                seen_ids.add(cid)
-                collected.append({"comment": item, "depth": depth})
-
-            replies_page = first_match(item, COMMENT_REPLIES_PAGE_PATHS) or {}
-            if replies_page.get("hasMore") and replies_page.get("nextCursor"):
-                queue.append((replies_page["nextCursor"], depth + 1))
-
-            inline_replies = first_match(item, COMMENT_REPLIES_ITEMS_PATHS)
-            if inline_replies:
-                for reply in inline_replies:
-                    rid = first_match(reply, COMMENT_ID_PATHS)
-                    if rid and rid not in seen_ids:
-                        seen_ids.add(rid)
-                        collected.append({"comment": reply, "depth": depth + 1})
+            if not walk_comment(item, base_depth):
+                break
 
         page = data.get("page") or {}
         if page.get("hasMore") and page.get("nextCursor"):
-            queue.append((page["nextCursor"], depth))
+            # Page-level pagination continues comments at the same depth as
+            # the current cursor page (root comments or a reply branch).
+            enqueue_cursor(page["nextCursor"], base_depth)
 
-    if max_comments:
-        collected = collected[:max_comments]
+    if queue:
+        truncated_by_cap = True
     return collected, post_detail, calls_made, truncated_by_cap
 
 
@@ -846,28 +1149,50 @@ def run_discovery(config_path="config.yaml", keywords_path="keywords.yaml", sour
 def run(config_path="config.yaml", keywords_path="keywords.yaml", sources_path="sources.yaml",
         only_source=None, days_override=None, max_posts_override=None, max_comments_override=None,
         max_api_calls_override=None, max_sf_calls_total_override=None, max_keywords_override=None,
-        skip_dedup=False, dry_run=False):
-    settings = load_yaml(config_path)["scraper"]
-    hybrid_settings = load_yaml(config_path).get("hybrid", {})
+        skip_dedup=False, dry_run=False, repair_posts_path=None):
+    """Run a normal incremental scrape or an explicit targeted repair.
+
+    Normal source runs discover candidate posts through Chocodata, remove IDs
+    already present in ``scraped_posts``, then apply ``max_posts_per_source``.
+    This means API credits are spent only on new posts.
+
+    Repair mode bypasses source discovery and re-fetches only the post IDs or
+    URLs listed in ``repair_posts_path``. Every fetched repair row is exported
+    and existing SQLite metadata is refreshed through upserts.
+    """
+    config_doc = load_yaml(config_path)
+    settings = config_doc["scraper"]
+    hybrid_settings = config_doc.get("hybrid", {})
     keywords_data = load_yaml(keywords_path)
     sources_data = load_yaml(sources_path)["sources"]
+    repair_mode = bool(repair_posts_path)
 
     choco_api_key = os.environ.get("CHOCODATA_API_KEY")
     sf_api_key = os.environ.get("SOCIALFETCH_API_KEY")
-    if not choco_api_key:
+
+    # Dry-run repair only validates the input file and SQLite metadata, so no
+    # API keys are needed. Normal dry-run still needs Chocodata for discovery.
+    if not repair_mode and not choco_api_key:
         print("ERROR: set the CHOCODATA_API_KEY environment variable (or put it in a .env file).")
         return
-    if not sf_api_key:
+    if not dry_run and not sf_api_key:
         print("ERROR: set the SOCIALFETCH_API_KEY environment variable (or put it in a .env file).")
         return
 
+    configured_max_posts = (
+        max_posts_override
+        if max_posts_override is not None
+        else settings["max_posts_per_source"]
+    )
     cfg = {
         "scrape_days": days_override if days_override is not None else settings["scrape_days"],
         "scrape_days_keyword_search": days_override if days_override is not None else (
             settings.get("scrape_days_keyword_search") or settings["scrape_days"]
         ),
         "min_comments_threshold": settings["min_comments_threshold"],
-        "max_posts_per_source": max_posts_override if max_posts_override is not None else settings["max_posts_per_source"],
+        # Discovery intentionally runs without the post cap. The configured cap
+        # is applied only after already-scraped IDs have been removed.
+        "max_posts_per_source": 0,
         "max_comments_per_post": max_comments_override if max_comments_override is not None else settings["max_comments_per_post"],
         "page_size": settings["page_size"],
         "full_scrape_sort": settings["full_scrape_sort"],
@@ -887,140 +1212,251 @@ def run(config_path="config.yaml", keywords_path="keywords.yaml", sources_path="
               f"from {keywords_path} (--max-keywords {max_keywords_override}).")
         all_keywords = all_keywords[:max_keywords_override]
 
-    choco_client = ChocodataClient(choco_api_key, delay_seconds=settings["request_delay_seconds"])
-    sf_client = SocialFetchClient(sf_api_key, delay_seconds=settings["request_delay_seconds"])
+    choco_client = (
+        ChocodataClient(choco_api_key, delay_seconds=settings["request_delay_seconds"])
+        if choco_api_key else None
+    )
+    sf_client = (
+        SocialFetchClient(sf_api_key, delay_seconds=settings["request_delay_seconds"])
+        if sf_api_key else None
+    )
 
-    seen_ids = set() if skip_dedup else load_seen_ids()
-    print(f"Loaded {len(seen_ids)} previously-exported comment IDs from state."
+    state_conn = open_state_db()
+    seen_ids = set() if skip_dedup else load_seen_ids(state_conn)
+    known_post_ids = set() if skip_dedup else load_known_post_ids(state_conn)
+    print(f"Loaded {len(seen_ids)} previously-exported comment IDs and "
+          f"{len(known_post_ids)} scraped post IDs from SQLite state."
           + ("  [--no-dedup: ignoring for this run]" if skip_dedup else ""))
 
     cutoff_ts_full = None
-    if cfg["scrape_days"]:
+    if not repair_mode and cfg["scrape_days"]:
         cutoff_ts_full = (datetime.now(timezone.utc) - timedelta(days=cfg["scrape_days"])).timestamp()
         print(f"Scraping last {cfg['scrape_days']} day(s) for full_scrape sources (since {to_iso(cutoff_ts_full)}).")
 
     cutoff_ts_keyword = None
-    if cfg["scrape_days_keyword_search"]:
+    if not repair_mode and cfg["scrape_days_keyword_search"]:
         cutoff_ts_keyword = (datetime.now(timezone.utc) - timedelta(days=cfg["scrape_days_keyword_search"])).timestamp()
         print(f"Scraping last {cfg['scrape_days_keyword_search']} day(s) for keyword_search sources (since {to_iso(cutoff_ts_keyword)}).")
 
     if cfg["max_sf_calls_total_per_run"]:
         print(f"SocialFetch run budget: {cfg['max_sf_calls_total_per_run']} call(s) total.")
 
-    all_new_rows = []
-    new_ids_this_run = set()
+    # Every work item has a uniform shape, regardless of whether it came from
+    # source discovery or the repair file.
+    work_items = []
+    skipped_known_posts = 0
+
+    if repair_mode:
+        try:
+            repair_candidates = load_repair_candidates(repair_posts_path, state_conn)
+        except (FileNotFoundError, ValueError) as error:
+            state_conn.close()
+            print(f"ERROR: {error}")
+            return
+        print(f"\nRepair mode: {len(repair_candidates)} unique post target(s) loaded from {repair_posts_path}.")
+        for candidate in repair_candidates:
+            work_items.append(candidate)
+        if dry_run:
+            for candidate in repair_candidates:
+                print(f"  - {candidate['post_id']}: {candidate['post'].get('permalink', '')}")
+            state_conn.close()
+            print("\n[--dry-run] Repair list validated — no API calls, CSV, or state updates.")
+            return
+    else:
+        for source in sources_data:
+            name = source["name"]
+            if only_source and name.lower() != only_source.lower():
+                continue
+            source_type = source["type"]
+            print(f"\n=== {name} ({source_type}) ===")
+
+            if source_type == "full_scrape":
+                candidates = collect_full_scrape_candidates(choco_client, source, cfg, cutoff_ts_full)
+            elif source_type == "keyword_search":
+                candidates = collect_keyword_search_candidates(choco_client, source, all_keywords, cfg, cutoff_ts_keyword)
+            else:
+                print(f"  [warn] unknown source type '{source_type}', skipping")
+                continue
+
+            threshold = cfg["min_comments_threshold"]
+            if threshold:
+                before = len(candidates)
+                candidates = {
+                    pid: value for pid, value in candidates.items()
+                    if (first_match(value[0], POST_NUM_COMMENTS_PATHS) or 0) >= threshold
+                }
+                print(f"  {before} candidates -> {len(candidates)} with >= {threshold} comments")
+
+            candidates, skipped = filter_new_candidates(
+                candidates,
+                known_post_ids,
+                max_posts=max(0, int(configured_max_posts or 0)),
+            )
+            skipped_known_posts += skipped
+            print(f"  {skipped} already scraped; {len(candidates)} new post(s) selected")
+
+            for post_id, (post, matched_keyword) in candidates.items():
+                work_items.append({
+                    "post_id": str(post_id),
+                    "post": post,
+                    "subreddit": name,
+                    "source_type": source_type,
+                    "intake_mode": source_type,
+                    "matched_keyword": matched_keyword,
+                })
+
+        if dry_run:
+            print(f"\n[--dry-run] {len(work_items)} new post(s) selected; no comments fetched, CSV written, or state updated.")
+            for item in work_items:
+                title = first_match(item["post"], POST_TITLE_PATHS) or ""
+                permalink = to_full_reddit_url(first_match(item["post"], POST_PERMALINK_PATHS)) or ""
+                print(f"  - {item['post_id']}: {title[:70]} — {permalink}")
+            state_conn.close()
+            return
+
+    all_output_rows = []
+    output_ids_this_run = set()
+    scraped_post_rows = []
     posts_skipped_budget = 0
     total_posts_via_chocodata = 0
     total_posts_via_socialfetch = 0
+    new_comment_count = 0
+    refreshed_comment_count = 0
 
-    for source in sources_data:
-        name = source["name"]
-        if only_source and name.lower() != only_source.lower():
+    for item in work_items:
+        post_id = item["post_id"]
+        post = item["post"]
+        name = item.get("subreddit") or ""
+        source_type = item.get("source_type") or ("repair" if repair_mode else "")
+        intake_mode = item.get("intake_mode") or source_type
+        matched_keyword = item.get("matched_keyword") or ""
+        title = first_match(post, POST_TITLE_PATHS) or ""
+        permalink = to_full_reddit_url(first_match(post, POST_PERMALINK_PATHS))
+        num_comments = first_match(post, POST_NUM_COMMENTS_PATHS)
+        print(f"  fetching comments for {post_id} ({title[:60]!r})")
+
+        if not permalink:
+            print("    [warn] no permalink found for this post, skipping comments")
             continue
-        source_type = source["type"]
-        print(f"\n=== {name} ({source_type}) ===")
 
-        if source_type == "full_scrape":
-            candidates = collect_full_scrape_candidates(choco_client, source, cfg, cutoff_ts_full)
-        elif source_type == "keyword_search":
-            candidates = collect_keyword_search_candidates(choco_client, source, all_keywords, cfg, cutoff_ts_keyword)
-        else:
-            print(f"  [warn] unknown source type '{source_type}', skipping")
-            continue
+        # Repair mode always uses SocialFetch because the purpose is a complete,
+        # targeted refresh. Normal runs retain the cheaper Chocodata path for
+        # very small posts.
+        use_chocodata = (
+            not repair_mode
+            and bool(cfg["chocodata_comment_threshold"])
+            and num_comments is not None
+            and num_comments < cfg["chocodata_comment_threshold"]
+        )
 
-        threshold = cfg["min_comments_threshold"]
-        if threshold:
-            before = len(candidates)
-            candidates = {
-                pid: v for pid, v in candidates.items()
-                if (first_match(v[0], POST_NUM_COMMENTS_PATHS) or 0) >= threshold
-            }
-            print(f"  {before} candidates -> {len(candidates)} with >= {threshold} comments")
+        flat = None
+        truncated_by_cap = False
+        if use_chocodata:
+            flat, calls_made, truncated_by_cap = fetch_chocodata_comments(
+                choco_client, permalink, cfg["comment_sort_passes"],
+                max_comments=cfg["max_comments_per_post"], expected_total=num_comments,
+            )
+            if not flat and num_comments:
+                print(f"    [warn] Chocodata returned 0 comments for a post reporting {num_comments} — falling back to SocialFetch")
+                flat = None
+            else:
+                total_posts_via_chocodata += 1
+                cap_note = " [fewer than expected — Chocodata truncation likely]" if truncated_by_cap else ""
+                print(f"    {len(flat)} comment(s) via Chocodata, {calls_made} call(s){cap_note}")
 
-        sub_new_count = 0
-        posts_via_chocodata = 0
-        posts_via_socialfetch = 0
-        for post_id, (post, matched_keyword) in candidates.items():
-            title = first_match(post, POST_TITLE_PATHS) or ""
-            permalink = to_full_reddit_url(first_match(post, POST_PERMALINK_PATHS))
-            num_comments = first_match(post, POST_NUM_COMMENTS_PATHS)
-            print(f"  fetching comments for {post_id} ({title[:60]!r})")
-            if dry_run:
+        if flat is None:
+            budget_total = cfg["max_sf_calls_total_per_run"]
+            per_post_cap = cfg["max_api_calls_per_post"]
+            if budget_total:
+                remaining = budget_total - sf_client.total_requests
+                if remaining <= 0:
+                    print(f"    [budget] SocialFetch run budget ({budget_total}) exhausted — skipping")
+                    posts_skipped_budget += 1
+                    continue
+                effective_cap = remaining if not per_post_cap else min(per_post_cap, remaining)
+            else:
+                effective_cap = per_post_cap
+
+            flat, detail, calls_made, truncated_by_cap = fetch_all_comments(
+                sf_client, permalink,
+                max_comments=cfg["max_comments_per_post"], max_api_calls=effective_cap,
+            )
+            total_posts_via_socialfetch += 1
+            cap_note = " [capped — more comments/replies remained]" if truncated_by_cap else ""
+            print(f"    {len(flat)} comment(s) via SocialFetch, {calls_made} call(s){cap_note}")
+
+            # Unknown repair URLs may not have title metadata in SQLite. Reuse
+            # the post object from SocialFetch when it is available.
+            if repair_mode and isinstance(detail, dict):
+                title = title or first_match(detail, POST_TITLE_PATHS) or ""
+                discovered_id = first_match(detail, POST_ID_PATHS)
+                if discovered_id:
+                    post_id = str(discovered_id)
+
+        scraped_at = datetime.now(timezone.utc).isoformat()
+        scraped_post_rows.append({
+            "post_id": str(post_id),
+            "subreddit": name,
+            "source_type": source_type,
+            "matched_keyword": matched_keyword,
+            "title": clean(title),
+            "permalink": permalink,
+            "reported_comment_count": num_comments,
+            "fetched_comment_count": len(flat),
+            "was_truncated": truncated_by_cap,
+            "last_scraped_at": scraped_at,
+        })
+
+        for flat_item in flat:
+            cid = first_match(flat_item["comment"], COMMENT_ID_PATHS)
+            if not cid or cid in output_ids_this_run:
                 continue
-            if not permalink:
-                print("    [warn] no permalink found for this post, skipping comments")
-                continue
-
-            threshold = cfg["chocodata_comment_threshold"]
-            use_chocodata = bool(threshold) and num_comments is not None and num_comments < threshold
-
-            flat = None
-            if use_chocodata:
-                flat, calls_made, truncated_by_cap = fetch_chocodata_comments(
-                    choco_client, permalink, cfg["comment_sort_passes"],
-                    max_comments=cfg["max_comments_per_post"], expected_total=num_comments,
+            is_new = cid not in seen_ids
+            if repair_mode or skip_dedup or is_new:
+                row = comment_row(
+                    flat_item, post_id, title, permalink, name,
+                    intake_mode, matched_keyword,
                 )
-                if not flat and num_comments:
-                    print(f"    [warn] Chocodata returned 0 comments for a post reporting {num_comments} — falling back to SocialFetch")
-                    flat = None
+                all_output_rows.append(row)
+                output_ids_this_run.add(cid)
+                if is_new:
+                    new_comment_count += 1
                 else:
-                    posts_via_chocodata += 1
-                    cap_note = " [fewer than expected — Chocodata truncation likely]" if truncated_by_cap else ""
-                    print(f"    {len(flat)} comment(s) via Chocodata, {calls_made} call(s){cap_note}")
+                    refreshed_comment_count += 1
 
-            if flat is None:
-                budget_total = cfg["max_sf_calls_total_per_run"]
-                per_post_cap = cfg["max_api_calls_per_post"]
-                if budget_total:
-                    remaining = budget_total - sf_client.total_requests
-                    if remaining <= 0:
-                        print(f"    [budget] SocialFetch run budget ({budget_total}) exhausted — skipping")
-                        posts_skipped_budget += 1
-                        continue
-                    effective_cap = remaining if not per_post_cap else min(per_post_cap, remaining)
-                else:
-                    effective_cap = per_post_cap
-
-                flat, _detail, calls_made, truncated_by_cap = fetch_all_comments(
-                    sf_client, permalink,
-                    max_comments=cfg["max_comments_per_post"], max_api_calls=effective_cap,
-                )
-                posts_via_socialfetch += 1
-                cap_note = " [capped — more comments/replies remained]" if truncated_by_cap else ""
-                print(f"    {len(flat)} comment(s) via SocialFetch, {calls_made} call(s){cap_note}")
-
-            for item in flat:
-                cid = first_match(item["comment"], COMMENT_ID_PATHS)
-                if cid and cid not in seen_ids and cid not in new_ids_this_run:
-                    all_new_rows.append(
-                        comment_row(item, post_id, title, permalink, name, source_type, matched_keyword)
-                    )
-                    new_ids_this_run.add(cid)
-                    sub_new_count += 1
-
-        print(f"  -> {len(candidates)} candidate posts, {sub_new_count} new comments found"
-              f" ({posts_via_chocodata} via Chocodata, {posts_via_socialfetch} via SocialFetch)")
-        total_posts_via_chocodata += posts_via_chocodata
-        total_posts_via_socialfetch += posts_via_socialfetch
-
-    print(f"\nChocodata: {choco_client.total_requests} request(s) (discovery + comments).")
-    print(f"SocialFetch: {sf_client.total_requests} request(s), {sf_client.total_credits_charged} credit(s) charged."
+    choco_requests = choco_client.total_requests if choco_client else 0
+    sf_requests = sf_client.total_requests if sf_client else 0
+    sf_credits = sf_client.total_credits_charged if sf_client else 0
+    print(f"\nChocodata: {choco_requests} request(s) (discovery + comments).")
+    print(f"SocialFetch: {sf_requests} request(s), {sf_credits} credit(s) charged."
           + (f" {posts_skipped_budget} post(s) skipped (run budget exhausted)." if posts_skipped_budget else ""))
-    print(f"Cost split: {total_posts_via_chocodata} post(s) via Chocodata (<{cfg['chocodata_comment_threshold']} comments), "
-          f"{total_posts_via_socialfetch} post(s) via SocialFetch (>={cfg['chocodata_comment_threshold']} comments, or count unknown).")
+    print(f"Cost split: {total_posts_via_chocodata} post(s) via Chocodata, "
+          f"{total_posts_via_socialfetch} post(s) via SocialFetch.")
 
-    if dry_run:
-        print("\n[--dry-run] Stopped before fetching comments — no CSV written, no state updated.")
-        return
-
-    csv_path = write_csv(all_new_rows, COMMENT_FIELDS)
+    filename_prefix = "reddit_comments_repair" if repair_mode else "reddit_comments"
+    csv_path = write_csv(all_output_rows, COMMENT_FIELDS, filename_prefix=filename_prefix)
     if not skip_dedup:
-        append_seen_ids(new_ids_this_run)
+        # Normal mode stores only newly exported comments. Repair mode upserts
+        # every fetched row so parent/depth/thread metadata is refreshed.
+        state_comment_rows = all_output_rows if repair_mode else [
+            row for row in all_output_rows if row["comment_id"] not in seen_ids
+        ]
+        save_scrape_state(state_conn, state_comment_rows, scraped_post_rows)
+    state_conn.close()
 
+    print("\nRun complete")
+    print(f"  Mode:                {'repair' if repair_mode else 'incremental'}")
+    if not repair_mode:
+        print(f"  Known posts skipped: {skipped_known_posts}")
+    print(f"  Posts processed:     {len(scraped_post_rows)}")
+    print(f"  New comments:        {new_comment_count}")
+    if repair_mode:
+        print(f"  Refreshed comments:  {refreshed_comment_count}")
     if csv_path:
-        print(f"\nDone. {len(all_new_rows)} new comments written to:\n  {csv_path}")
+        print(f"  CSV:                  {csv_path}")
     else:
-        print("\nDone. No new comments since the last run — no file created.")
+        print("  CSV:                  no rows written")
+    print(f"  SQLite state:         {STATE_DB_PATH}")
 
 
 # ---------- interactive menu ----------
@@ -1035,8 +1471,9 @@ def interactive_menu(config_path="config.yaml", keywords_path="keywords.yaml", s
     print("  3) Test one source — custom day window / post cap / comment cap")
     print("  4) Dry run — list candidate posts only, don't fetch comments or write CSV")
     print("  5) Discovery — Chocodata only: pick a subreddit/keywords, review candidate posts, export selection to CSV")
-    print("  6) Quit")
-    choice = input("\nChoice [1-6]: ").strip()
+    print("  6) Targeted repair — re-fetch IDs/URLs from a text file")
+    print("  7) Quit")
+    choice = input("\nChoice [1-7]: ").strip()
 
     if choice == "1":
         run(config_path, keywords_path, sources_path)
@@ -1062,6 +1499,12 @@ def interactive_menu(config_path="config.yaml", keywords_path="keywords.yaml", s
         run(config_path, keywords_path, sources_path, only_source=src, days_override=1, max_posts_override=5, dry_run=True)
     elif choice == "5":
         run_discovery(config_path, keywords_path, sources_path)
+    elif choice == "6":
+        repair_path = input("Repair file path [repair_posts.txt]: ").strip() or "repair_posts.txt"
+        run(
+            config_path, keywords_path, sources_path,
+            repair_posts_path=repair_path,
+        )
     else:
         print("Bye.")
 
@@ -1084,20 +1527,31 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Reddit monitor (Chocodata discovery + SocialFetch full comment trees)")
     parser.add_argument("--all", action="store_true", help="Full run, all sources, no menu")
     parser.add_argument("--source", default=None, help="Run only this source")
+    parser.add_argument(
+        "--repair-posts",
+        metavar="FILE",
+        help=(
+            "Re-fetch only the Reddit post IDs or URLs listed in FILE and "
+            "refresh their CSV/SQLite metadata"
+        ),
+    )
     parser.add_argument("--days", type=int, default=None, help="Override scrape_days for this run")
-    parser.add_argument("--max-posts", type=int, default=None, help="Override max_posts_per_source for this run")
+    parser.add_argument("--max-posts", type=int, default=None, help="Maximum NEW posts per source after known posts are skipped")
     parser.add_argument("--max-comments", type=int, default=None, help="Override max_comments_per_post for this run")
     parser.add_argument("--max-api-calls", type=int, default=None, help="Override max_api_calls_per_post (SocialFetch pages per post, default 20)")
     parser.add_argument("--max-sf-calls-total", type=int, default=None, help="Cap total SocialFetch calls across the whole run")
     parser.add_argument("--max-keywords", type=int, default=None, help="Only search the first N keywords (in keywords.yaml's order) for keyword_search sources")
-    parser.add_argument("--no-dedup", action="store_true", help="Ignore state/seen_comment_ids.txt for this run")
+    parser.add_argument("--no-dedup", action="store_true", help="Ignore the SQLite dedup state for this run")
     parser.add_argument("--dry-run", action="store_true", help="List candidate posts only — no comment fetch, no CSV, no state update")
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--keywords", default="keywords.yaml")
     parser.add_argument("--sources", default="sources.yaml")
     args = parser.parse_args()
 
-    if not (args.all or args.source or args.days or args.max_posts or args.max_comments or args.max_api_calls or args.max_sf_calls_total or args.max_keywords or args.dry_run):
+    if args.repair_posts and (args.all or args.source):
+        parser.error("--repair-posts cannot be combined with --all or --source")
+
+    if not (args.all or args.source or args.repair_posts or args.days or args.max_posts or args.max_comments or args.max_api_calls or args.max_sf_calls_total or args.max_keywords or args.dry_run):
         interactive_menu(args.config, args.keywords, args.sources)
     else:
         run(
@@ -1111,4 +1565,5 @@ if __name__ == "__main__":
             max_keywords_override=args.max_keywords,
             skip_dedup=args.no_dedup,
             dry_run=args.dry_run,
+            repair_posts_path=args.repair_posts,
         )

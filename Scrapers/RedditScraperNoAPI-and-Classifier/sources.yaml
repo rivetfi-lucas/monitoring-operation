@@ -1,0 +1,16 @@
+sources:
+  - name: merval
+    url: https://www.reddit.com/r/merval
+    type: full_scrape
+
+  - name: AskArgentina
+    url: https://www.reddit.com/r/AskArgentina
+    type: full_scrape
+
+  - name: argentina
+    url: https://www.reddit.com/r/argentina
+    type: keyword_search
+
+  - name: RepublicaArgentina
+    url: https://www.reddit.com/r/RepublicaArgentina
+    type: keyword_search

@@ -1,0 +1,9 @@
+# --- Classification pipeline (classify_comments.py) ---
+classification:
+  model_sonnet: "claude-sonnet-5"
+  model_haiku: "claude-haiku-4-5-20251001"
+  max_comments_per_call: 40      # comments grouped into one API call (amortizes the rubric's token cost)
+  max_output_tokens: 4096
+  poll_interval_seconds: 30      # how often to check batch job status
+  rubric_path: "rubric.md"       # Question Architecture — paste the real rubric in here
+
